@@ -1,44 +1,26 @@
-from rich.live import Live
 from rich.panel import Panel
 from rich.box import MINIMAL
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.console import Group
-from rich.console import Console
+from .base_block import BaseBlock
 
-
-class CodeBlock:
+class CodeBlock(BaseBlock):
   """
-  Code Blocks display code and outputs in different languages.
+  Code Blocks display code and outputs in different languages. You can also set the active_line!
   """
 
   def __init__(self):
+    super().__init__()
+
+    self.type = "code"
+
     # Define these for IDE auto-completion
     self.language = ""
     self.output = ""
     self.code = ""
     self.active_line = None
-
-    self.live = Live(auto_refresh=False, console=Console(), vertical_overflow="visible")
-    self.live.start()
-
-  def update_from_message(self, message):
-    if "function_call" in message and "parsed_arguments" in message[
-        "function_call"]:
-
-      parsed_arguments = message["function_call"]["parsed_arguments"]
-
-      if parsed_arguments != None:
-        self.language = parsed_arguments.get("language")
-        self.code = parsed_arguments.get("code")
-
-        if self.code and self.language:
-          self.refresh()
-
-  def end(self):
-    self.refresh(cursor=False)
-    # Destroys live display
-    self.live.stop()
+    self.margin_top = True
 
   def refresh(self, cursor=True):
     # Get code, return if there is none
@@ -56,7 +38,7 @@ class CodeBlock:
 
     # Add cursor    
     if cursor:
-      code += "█"
+      code += "●"
 
     # Add each line of code to the table
     code_lines = code.strip().split('\n')
@@ -82,11 +64,14 @@ class CodeBlock:
                            style="#FFFFFF on #3b3b37")
 
     # Create a group with the code table and output panel
-    group = Group(
-      code_panel,
-      output_panel,
-    )
+    group_items = [code_panel, output_panel]
+    if self.margin_top:
+        # This adds some space at the top. Just looks good!
+        group_items = [""] + group_items
+    group = Group(*group_items)
 
     # Update the live display
     self.live.update(group)
     self.live.refresh()
+
+

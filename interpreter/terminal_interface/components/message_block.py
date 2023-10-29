@@ -1,34 +1,25 @@
-from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.box import MINIMAL
 import re
+from .base_block import BaseBlock
 
-
-class MessageBlock:
+class MessageBlock(BaseBlock):
 
   def __init__(self):
-    self.live = Live(auto_refresh=False, console=Console())
-    self.live.start()
-    self.content = ""
+    super().__init__()
 
-  def update_from_message(self, message):
-    self.content = message.get("content", "")
-    if self.content:
-      self.refresh()
-
-  def end(self):
-    self.refresh(cursor=False)
-    self.live.stop()
+    self.type = "message"
+    self.message = ""
+    self.has_run = False
 
   def refresh(self, cursor=True):
     # De-stylize any code blocks in markdown,
     # to differentiate from our Code Blocks
-    content = textify_markdown_code_blocks(self.content)
+    content = textify_markdown_code_blocks(self.message)
     
     if cursor:
-      content += "█"
+      content += "●"
       
     markdown = Markdown(content.strip())
     panel = Panel(markdown, box=MINIMAL)
