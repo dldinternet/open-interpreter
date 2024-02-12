@@ -1,166 +1,308 @@
-from ..code_interpreters.create_code_interpreter import create_code_interpreter
-from ..utils.merge_deltas import merge_deltas
-from ..utils.display_markdown_message import display_markdown_message
-from ..utils.truncate_output import truncate_output
-from ..code_interpreters.language_map import language_map
+import json
+import re
 import traceback
+
 import litellm
+
+from ..terminal_interface.utils.display_markdown_message import display_markdown_message
+from .render_message import render_message
+
 
 def respond(interpreter):
     """
-    Yields tokens, but also adds them to interpreter.messages. TBH probably would be good to seperate those two responsibilities someday soon
+    Yields chunks.
     Responds until it decides not to run any more code or say anything else.
     """
 
+    last_unsupported_code = ""
+    insert_force_task_completion_message = False
+
     while True:
+        ## RENDER SYSTEM MESSAGE ##
 
-        system_message = interpreter.generate_system_message()
+        system_message = interpreter.system_message
 
-        # Create message object
-        system_message = {"role": "system", "message": system_message}
+        # Add language-specific system messages
+        for language in interpreter.computer.terminal.languages:
+            if hasattr(language, "system_message"):
+                system_message += "\n\n" + language.system_message
+
+        # Add custom instructions
+        if interpreter.custom_instructions:
+            system_message += "\n\n" + interpreter.custom_instructions
+
+        ## Rendering ↓
+        rendered_system_message = render_message(interpreter, system_message)
+        ## Rendering ↑
+
+        rendered_system_message = {
+            "role": "system",
+            "type": "message",
+            "content": rendered_system_message,
+        }
 
         # Create the version of messages that we'll send to the LLM
         messages_for_llm = interpreter.messages.copy()
-        messages_for_llm = [system_message] + messages_for_llm
+        messages_for_llm = [rendered_system_message] + messages_for_llm
 
-        # It's best to explicitly tell these LLMs when they don't get an output
-        for message in messages_for_llm:
-            if "output" in message and message["output"] == "":
-                message["output"] = "No output"
-
+        if insert_force_task_completion_message:
+            messages_for_llm.append(
+                {
+                    "role": "user",
+                    "type": "message",
+                    "content": force_task_completion_message,
+                }
+            )
+            # Yield two newlines to seperate the LLMs reply from previous messages.
+            yield {"role": "assistant", "type": "message", "content": "\n\n"}
 
         ### RUN THE LLM ###
 
-        # Add a new message from the assistant to interpreter's "messages" attribute
-        # (This doesn't go to the LLM. We fill this up w/ the LLM's response)
-        interpreter.messages.append({"role": "assistant"})
-
-        # Start putting chunks into the new message
-        # + yielding chunks to the user
         try:
+            for chunk in interpreter.llm.run(messages_for_llm):
+                yield {"role": "assistant", **chunk}
 
-            # Track the type of chunk that the coding LLM is emitting
-            chunk_type = None
-
-            for chunk in interpreter._llm(messages_for_llm):
-
-                # Add chunk to the last message
-                interpreter.messages[-1] = merge_deltas(interpreter.messages[-1], chunk)
-
-                # This is a coding llm
-                # It will yield dict with either a message, language, or code (or language AND code)
-
-                # We also want to track which it's sending to we can send useful flags.
-                # (otherwise pretty much everyone needs to implement this)
-                if "message" in chunk and chunk_type != "message":
-                    chunk_type = "message"
-                    yield {"start_of_message": True}
-                elif "language" in chunk and chunk_type != "code":
-                    chunk_type = "code"
-                    yield {"start_of_code": True}
-                if "code" in chunk and chunk_type != "code":
-                    # (This shouldn't happen though — ^ "language" should be emitted first, but sometimes GPT-3.5 forgets this)
-                    # (But I'm pretty sure we handle that? If it forgets we emit Python anyway?)
-                    chunk_type = "code"
-                    yield {"start_of_code": True}
-                elif "message" not in chunk and chunk_type == "message":
-                    chunk_type = None
-                    yield {"end_of_message": True}
-
-                yield chunk
-
-            # We don't trigger the end_of_message or end_of_code flag if we actually end on either
-            if chunk_type == "message":
-                yield {"end_of_message": True}
-            elif chunk_type == "code":
-                yield {"end_of_code": True}
-            
         except litellm.exceptions.BudgetExceededError:
-            display_markdown_message(f"""> Max budget exceeded
+            display_markdown_message(
+                f"""> Max budget exceeded
 
                 **Session spend:** ${litellm._current_cost}
                 **Max budget:** ${interpreter.max_budget}
 
                 Press CTRL-C then run `interpreter --max_budget [higher USD amount]` to proceed.
-            """)
+            """
+            )
             break
         # Provide extra information on how to change API keys, if we encounter that error
         # (Many people writing GitHub issues were struggling with this)
         except Exception as e:
-            if 'auth' in str(e).lower() or 'api key' in str(e).lower():
+            if (
+                interpreter.offline == False
+                and "auth" in str(e).lower()
+                or "api key" in str(e).lower()
+            ):
                 output = traceback.format_exc()
-                raise Exception(f"{output}\n\nThere might be an issue with your API key(s).\n\nTo reset your API key (we'll use OPENAI_API_KEY for this example, but you may need to reset your ANTHROPIC_API_KEY, HUGGINGFACE_API_KEY, etc):\n        Mac/Linux: 'export OPENAI_API_KEY=your-key-here',\n        Windows: 'setx OPENAI_API_KEY your-key-here' then restart terminal.\n\n")
+                raise Exception(
+                    f"{output}\n\nThere might be an issue with your API key(s).\n\nTo reset your API key (we'll use OPENAI_API_KEY for this example, but you may need to reset your ANTHROPIC_API_KEY, HUGGINGFACE_API_KEY, etc):\n        Mac/Linux: 'export OPENAI_API_KEY=your-key-here',\n        Windows: 'setx OPENAI_API_KEY your-key-here' then restart terminal.\n\n"
+                )
+            elif interpreter.offline == False and "not have access" in str(e).lower():
+                response = input(
+                    f"  You do not have access to {interpreter.llm.model}. You will need to add a payment method and purchase credits for the OpenAI API billing page (different from ChatGPT) to use `GPT-4`.\n\nhttps://platform.openai.com/account/billing/overview\n\nWould you like to try GPT-3.5-TURBO instead? (y/n)\n\n  "
+                )
+                print("")  # <- Aesthetic choice
+
+                if response.strip().lower() == "y":
+                    interpreter.llm.model = "gpt-3.5-turbo-1106"
+                    interpreter.llm.context_window = 16000
+                    interpreter.llm.max_tokens = 4096
+                    interpreter.llm.supports_functions = True
+                    display_markdown_message(
+                        f"> Model set to `{interpreter.llm.model}`"
+                    )
+                else:
+                    raise Exception(
+                        "\n\nYou will need to add a payment method and purchase credits for the OpenAI API billing page (different from ChatGPT) to use GPT-4.\n\nhttps://platform.openai.com/account/billing/overview"
+                    )
+            elif interpreter.offline and not interpreter.os:
+                print(traceback.format_exc())
+                raise Exception(
+                    "Error occurred. "
+                    + str(e)
+                    + """
+
+If you're running `interpreter --local`, please make sure LM Studio's local server is running.
+
+If LM Studio's local server is running, please try a language model with a different architecture.
+
+                    """
+                )
             else:
                 raise
-        
-        
-        
+
         ### RUN CODE (if it's there) ###
 
-        if "code" in interpreter.messages[-1]:
-            
-            if interpreter.debug_mode:
+        if interpreter.messages[-1]["type"] == "code":
+            if interpreter.verbose:
                 print("Running code:", interpreter.messages[-1])
 
             try:
-                # What code do you want to run?
-                code = interpreter.messages[-1]["code"]
+                # What language/code do you want to run?
+                language = interpreter.messages[-1]["format"].lower().strip()
+                code = interpreter.messages[-1]["content"]
 
-                # Fix a common error where the LLM thinks it's in a Jupyter notebook
-                if interpreter.messages[-1]["language"] == "python" and code.startswith("!"):
-                    code = code[1:]
-                    interpreter.messages[-1]["code"] = code
-                    interpreter.messages[-1]["language"] = "shell"
+                if interpreter.os and language == "text":
+                    # It does this sometimes just to take notes. Let it, it's useful.
+                    # In the future we should probably not detect this behavior as code at all.
+                    continue
 
-                # Get a code interpreter to run it
-                language = interpreter.messages[-1]["language"]
-                if language in language_map:
-                    if language not in interpreter._code_interpreters:
-                        interpreter._code_interpreters[language] = create_code_interpreter(language)
-                    code_interpreter = interpreter._code_interpreters[language]
-                else:
-                    #This still prints the code but don't allow code to run. Let's Open-Interpreter know through output message
-                    error_output = f"Error: Open Interpreter does not currently support {language}."
-                    print(error_output)
+                # Is this language enabled/supported?
+                if interpreter.computer.terminal.get_language(language) == None:
+                    output = f"`{language}` disabled or not supported."
 
-                    interpreter.messages[-1]["output"] = ""
-                    output = "\n" + error_output
+                    yield {
+                        "role": "computer",
+                        "type": "console",
+                        "format": "output",
+                        "content": output,
+                    }
 
-                    # Truncate output
-                    output = truncate_output(output, interpreter.max_output)
-                    interpreter.messages[-1]["output"] = output.strip()
-                    break
+                    # Let the response continue so it can deal with the unsupported code in another way. Also prevent looping on the same piece of code.
+                    if code != last_unsupported_code:
+                        last_unsupported_code = code
+                        continue
+                    else:
+                        break
 
                 # Yield a message, such that the user can stop code execution if they want to
                 try:
-                    yield {"executing": {"code": code, "language": language}}
+                    yield {
+                        "role": "computer",
+                        "type": "confirmation",
+                        "format": "execution",
+                        "content": {
+                            "type": "code",
+                            "format": language,
+                            "content": code,
+                        },
+                    }
                 except GeneratorExit:
                     # The user might exit here.
                     # We need to tell python what we (the generator) should do if they exit
                     break
 
-                # Yield each line, also append it to last messages' output
-                interpreter.messages[-1]["output"] = ""
-                for line in code_interpreter.run(code):
-                    yield line
-                    if "output" in line:
-                        output = interpreter.messages[-1]["output"]
-                        output += "\n" + line["output"]
+                # don't let it import computer on os mode — we handle that!
+                if interpreter.os and language == "python":
+                    code = code.replace("import computer\n", "pass\n")
+                    code = re.sub(
+                        r"import computer\.(\w+) as (\w+)", r"\2 = computer.\1", code
+                    )
+                    code = re.sub(
+                        r"from computer import (\w+)", r"\1 = computer.\1", code
+                    )
+                    code = re.sub(
+                        r"from computer import (.+)",
+                        lambda m: "\n".join(
+                            f"{x.strip()} = computer.{x.strip()}"
+                            for x in m.group(1).split(",")
+                        ),
+                        code,
+                    )
+                    # If it does this it sees the screenshot twice (which is expected jupyter behavior)
+                    if code.split("\n")[-1] in [
+                        "computer.display.view()",
+                        "computer.display.screenshot()",
+                        "computer.view()",
+                        "computer.screenshot()",
+                    ]:
+                        code = code + "\npass"
 
-                        # Truncate output
-                        output = truncate_output(output, interpreter.max_output)
+                # sync up some things (is this how we want to do this?)
+                interpreter.computer.verbose = interpreter.verbose
+                interpreter.computer.emit_images = interpreter.llm.supports_vision
 
-                        interpreter.messages[-1]["output"] = output.strip()
+                # sync up the interpreter's computer with your computer
+                try:
+                    if interpreter.os and language == "python":
+                        computer_dict = interpreter.computer.to_dict()
+                        if computer_dict:
+                            computer_json = json.dumps(computer_dict)
+                            sync_code = f"""import json\ncomputer.load_dict(json.loads('''{computer_json}'''))"""
+                            interpreter.computer.run("python", sync_code)
+                except Exception as e:
+                    print(str(e))
+                    print("Continuing...")
+
+                ## ↓ CODE IS RUN HERE
+
+                for line in interpreter.computer.run(language, code, stream=True):
+                    yield {"role": "computer", **line}
+
+                ## ↑ CODE IS RUN HERE
+
+                # sync up your computer with the interpreter's computer
+                try:
+                    if interpreter.os and language == "python":
+                        # sync up the interpreter's computer with your computer
+                        result = interpreter.computer.run(
+                            "python",
+                            "import json\ncomputer_dict = computer.to_dict()\nif computer_dict:\n  print(json.dumps(computer_dict))",
+                        )
+                        result = result[-1]["content"]
+                        interpreter.computer.load_dict(
+                            json.loads(result.strip('"').strip("'"))
+                        )
+                except Exception as e:
+                    print(str(e))
+                    print("Continuing.")
+
+                # yield final "active_line" message, as if to say, no more code is running. unlightlight active lines
+                # (is this a good idea? is this our responsibility? i think so — we're saying what line of code is running! ...?)
+                yield {
+                    "role": "computer",
+                    "type": "console",
+                    "format": "active_line",
+                    "content": None,
+                }
 
             except:
-                output = traceback.format_exc()
-                yield {"output": output.strip()}
-                interpreter.messages[-1]["output"] = output.strip()
-
-            yield {"end_of_execution": True}
+                yield {
+                    "role": "computer",
+                    "type": "console",
+                    "format": "output",
+                    "content": traceback.format_exc(),
+                }
 
         else:
-            # Doesn't want to run code. We're done
+            ## FORCE TASK COMLETION
+            # This makes it utter specific phrases if it doesn't want to be told to "Proceed."
+
+            force_task_completion_message = """Proceed. You CAN run code on my machine. If you want to run code, start your message with "```"! If the entire task I asked for is done, say exactly 'The task is done.' If it's impossible, say 'The task is impossible.' (If I haven't provided a task, say exactly 'Let me know what you'd like to do next.') Otherwise keep going."""
+            if interpreter.os:
+                force_task_completion_message.replace(
+                    "If the entire task I asked for is done,",
+                    "If the entire task I asked for is done, take a screenshot to verify it's complete, or if you've already taken a screenshot and verified it's complete,",
+                )
+            force_task_completion_responses = [
+                "the task is done.",
+                "the task is impossible.",
+                "let me know what you'd like to do next.",
+            ]
+
+            if (
+                interpreter.force_task_completion
+                and interpreter.messages
+                and not any(
+                    task_status in interpreter.messages[-1].get("content", "").lower()
+                    for task_status in force_task_completion_responses
+                )
+            ):
+                # Remove past force_task_completion messages
+                interpreter.messages = [
+                    message
+                    for message in interpreter.messages
+                    if message.get("content", "") != force_task_completion_message
+                ]
+                # Combine adjacent assistant messages, so hopefully it learns to just keep going!
+                combined_messages = []
+                for message in interpreter.messages:
+                    if (
+                        combined_messages
+                        and message["role"] == "assistant"
+                        and combined_messages[-1]["role"] == "assistant"
+                        and message["type"] == "message"
+                        and combined_messages[-1]["type"] == "message"
+                    ):
+                        combined_messages[-1]["content"] += "\n" + message["content"]
+                    else:
+                        combined_messages.append(message)
+                interpreter.messages = combined_messages
+
+                # Send model the force_task_completion_message:
+                insert_force_task_completion_message = True
+
+                continue
+
+            # Doesn't want to run code. We're done!
             break
 
     return
