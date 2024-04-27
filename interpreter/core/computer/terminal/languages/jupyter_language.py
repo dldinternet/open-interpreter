@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import traceback
+import logging
 
 from jupyter_client import KernelManager
 
@@ -21,10 +22,11 @@ DEBUG_MODE = False
 class JupyterLanguage(BaseLanguage):
     file_extension = "py"
     name = "Python"
+    aliases = ["py"]
 
     def __init__(self, computer):
         self.computer = computer
-
+            
         self.km = KernelManager(kernel_name="python3")
         self.km.start_kernel()
         self.kc = self.km.client()
@@ -80,13 +82,10 @@ matplotlib.use('{backend}')
             if not os.path.exists(skill_library_path):
                 os.makedirs(skill_library_path)
 
-            for filename, code in functions.items():
+            for filename, function_code in functions.items():
                 with open(f"{skill_library_path}/{filename}.py", "w") as file:
-                    file.write(code)
+                    file.write(function_code)
 
-        # lel
-        # exec(code)
-        # return
         self.finish_flag = False
         try:
             try:
@@ -413,12 +412,17 @@ def string_to_python(code_as_string):
             if node.name.startswith("_"):
                 # ignore private functions
                 continue
+            docstring = ast.get_docstring(node)
+            body = node.body
+            if docstring:
+                body = body[1:]
+
+            code_body = ast.unparse(body[0]).replace("\n", "\n    ")
+
             func_info = {
                 "name": node.name,
-                "docstring": ast.get_docstring(node),
-                "body": "\n    ".join(
-                    ast.unparse(stmt) for stmt in node.body[1:]
-                ),  # Excludes the docstring
+                "docstring": docstring,
+                "body": code_body,
             }
             functions.append(func_info)
 
