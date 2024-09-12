@@ -4,19 +4,31 @@ Gotta split this out, generalize it, and move all the python additions to python
 """
 
 import ast
+import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
-import logging
 
 from jupyter_client import KernelManager
 
 from ..base_language import BaseLanguage
 
 DEBUG_MODE = False
+
+# When running from an executable, ipykernel calls itself infinitely
+# This is a workaround to detect it and launch it manually
+if "ipykernel_launcher" in sys.argv:
+    if sys.path[0] == "":
+        del sys.path[0]
+
+    from ipykernel import kernelapp as app
+
+    app.launch_new_instance()
+    sys.exit(0)
 
 
 class JupyterLanguage(BaseLanguage):
@@ -26,7 +38,7 @@ class JupyterLanguage(BaseLanguage):
 
     def __init__(self, computer):
         self.computer = computer
-            
+
         self.km = KernelManager(kernel_name="python3")
         self.km.start_kernel()
         self.kc = self.km.client()
@@ -50,6 +62,13 @@ class JupyterLanguage(BaseLanguage):
 import matplotlib
 matplotlib.use('{backend}')
         """.strip()
+
+        # Use Inline actually, it's better I think
+        code = """
+%matplotlib inline
+import matplotlib.pyplot as plt
+""".strip()
+
         for _ in self.run(code):
             pass
 
@@ -66,25 +85,28 @@ matplotlib.use('{backend}')
         self.km.shutdown_kernel()
 
     def run(self, code):
+        while not self.kc.is_alive():
+            time.sleep(0.1)
+
         ################################################################
         ### OFFICIAL OPEN INTERPRETER GOVERNMENT ISSUE SKILL LIBRARY ###
         ################################################################
 
-        try:
-            functions = string_to_python(code)
-        except:
-            # Non blocking
-            functions = {}
+        # try:
+        #     functions = string_to_python(code)
+        # except:
+        #     # Non blocking
+        #     functions = {}
 
-        if self.computer.save_skills and functions:
-            skill_library_path = self.computer.skills.path
+        # if self.computer.save_skills and functions:
+        #     skill_library_path = self.computer.skills.path
 
-            if not os.path.exists(skill_library_path):
-                os.makedirs(skill_library_path)
+        #     if not os.path.exists(skill_library_path):
+        #         os.makedirs(skill_library_path)
 
-            for filename, function_code in functions.items():
-                with open(f"{skill_library_path}/{filename}.py", "w") as file:
-                    file.write(function_code)
+        #     for filename, function_code in functions.items():
+        #         with open(f"{skill_library_path}/{filename}.py", "w") as file:
+        #             file.write(function_code)
 
         self.finish_flag = False
         try:
@@ -105,6 +127,7 @@ matplotlib.use('{backend}')
 
     def _execute_code(self, code, message_queue):
         def iopub_message_listener():
+            max_retries = 100
             while True:
                 # If self.finish_flag = True, and we didn't set it (we do below), we need to stop. That's our "stop"
                 if self.finish_flag == True:
@@ -112,14 +135,28 @@ matplotlib.use('{backend}')
                         print("interrupting kernel!!!!!")
                     self.km.interrupt_kernel()
                     return
+                # For async usage
+                if (
+                    hasattr(self.computer.interpreter, "stop_event")
+                    and self.computer.interpreter.stop_event.is_set()
+                ):
+                    self.km.interrupt_kernel()
+                    self.finish_flag = True
+                    return
                 try:
                     msg = self.kc.iopub_channel.get_msg(timeout=0.05)
                 except queue.Empty:
                     continue
+                except Exception as e:
+                    max_retries -= 1
+                    if max_retries < 0:
+                        raise
+                    print("Jupyter error, retrying:", str(e))
+                    continue
 
                 if DEBUG_MODE:
                     print("-----------" * 10)
-                    print("Message recieved:", msg["content"])
+                    print("Message received:", msg["content"])
                     print("-----------" * 10)
 
                 if (
@@ -226,6 +263,16 @@ matplotlib.use('{backend}')
 
     def _capture_output(self, message_queue):
         while True:
+            time.sleep(0.1)
+
+            # For async usage
+            if (
+                hasattr(self.computer.interpreter, "stop_event")
+                and self.computer.interpreter.stop_event.is_set()
+            ):
+                self.finish_flag = True
+                break
+
             if self.listener_thread:
                 try:
                     output = message_queue.get(timeout=0.1)
@@ -234,10 +281,17 @@ matplotlib.use('{backend}')
                     yield output
                 except queue.Empty:
                     if self.finish_flag:
-                        if DEBUG_MODE:
-                            print("we're done")
-                        break
-            time.sleep(0.1)
+                        time.sleep(0.1)
+
+                        try:
+                            output = message_queue.get(timeout=0.1)
+                            if DEBUG_MODE:
+                                print(output)
+                            yield output
+                        except queue.Empty:
+                            if DEBUG_MODE:
+                                print("we're done")
+                            break
 
     def stop(self):
         self.finish_flag = True
